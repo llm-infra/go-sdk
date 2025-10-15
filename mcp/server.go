@@ -378,7 +378,7 @@ func setSchema[T any](sfield *any, rfield **jsonschema.Resolved) (zero any, err 
 	if err != nil {
 		return zero, err
 	}
-	*rfield, err = internalSchema.Resolve(&jsonschema.ResolveOptions{ValidateDefaults: true})
+	*rfield, err = internalSchema.Resolve(nil)
 	return zero, err
 }
 
