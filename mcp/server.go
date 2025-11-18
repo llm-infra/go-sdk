@@ -19,6 +19,7 @@ import (
 	"reflect"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/jsonschema-go/jsonschema"
@@ -197,8 +198,10 @@ func (s *Server) AddTool(t *Tool, h ToolHandler) {
 		// discovered until runtime, when the LLM sent bad data.
 		panic(fmt.Errorf("AddTool %q: missing input schema", t.Name))
 	}
-	if s, ok := t.InputSchema.(*jsonschema.Schema); ok && s.Type != "object" {
-		panic(fmt.Errorf(`AddTool %q: input schema must have type "object"`, t.Name))
+	if s, ok := t.InputSchema.(*jsonschema.Schema); ok {
+		if s.Type != "object" {
+			panic(fmt.Errorf(`AddTool %q: input schema must have type "object"`, t.Name))
+		}
 	} else {
 		var m map[string]any
 		if err := remarshal(t.InputSchema, &m); err != nil {
@@ -209,8 +212,10 @@ func (s *Server) AddTool(t *Tool, h ToolHandler) {
 		}
 	}
 	if t.OutputSchema != nil {
-		if s, ok := t.OutputSchema.(*jsonschema.Schema); ok && s.Type != "object" {
-			panic(fmt.Errorf(`AddTool %q: output schema must have type "object"`, t.Name))
+		if s, ok := t.OutputSchema.(*jsonschema.Schema); ok {
+			if s.Type != "object" {
+				panic(fmt.Errorf(`AddTool %q: output schema must have type "object"`, t.Name))
+			}
 		} else {
 			var m map[string]any
 			if err := remarshal(t.OutputSchema, &m); err != nil {
@@ -370,10 +375,8 @@ func setSchema[T any](sfield *any, rfield **jsonschema.Resolved) (zero any, err 
 		if err == nil {
 			*sfield = internalSchema
 		}
-	} else {
-		if err := remarshal(*sfield, &internalSchema); err != nil {
-			return zero, err
-		}
+	} else if err := remarshal(*sfield, &internalSchema); err != nil {
+		return zero, err
 	}
 	if err != nil {
 		return zero, err
@@ -776,6 +779,7 @@ func (s *Server) Run(ctx context.Context, t Transport) error {
 	select {
 	case <-ctx.Done():
 		ss.Close()
+		<-ssClosed // wait until waiting go routine above actually completes
 		s.opts.Logger.Error("server run cancelled", "error", ctx.Err())
 		return ctx.Err()
 	case err := <-ssClosed:
@@ -822,7 +826,7 @@ func (s *Server) disconnect(cc *ServerSession) {
 type ServerSessionOptions struct {
 	State *ServerSessionState
 
-	onClose func()
+	onClose func() // used to clean up associated resources
 }
 
 // Connect connects the MCP server over the given transport and starts handling
@@ -917,7 +921,11 @@ func newServerRequest[P Params](ss *ServerSession, params P) *ServerRequest[P] {
 // Call [ServerSession.Close] to close the connection, or await client
 // termination with [ServerSession.Wait].
 type ServerSession struct {
-	onClose func()
+	// Ensure that onClose is called at most once.
+	// We defensively use an atomic CompareAndSwap rather than a sync.Once, in case the
+	// onClose callback triggers a re-entrant call to Close.
+	calledOnClose atomic.Bool
+	onClose       func()
 
 	server          *Server
 	conn            *jsonrpc2.Connection
@@ -1137,7 +1145,13 @@ func (ss *ServerSession) handle(ctx context.Context, req *jsonrpc.Request) (any,
 	return handleReceive(ctx, ss, req)
 }
 
-func (ss *ServerSession) InitializeParams() *InitializeParams { return ss.state.InitializeParams }
+// InitializeParams returns the InitializeParams provided during the client's
+// initial connection.
+func (ss *ServerSession) InitializeParams() *InitializeParams {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	return ss.state.InitializeParams
+}
 
 func (ss *ServerSession) initialize(ctx context.Context, params *InitializeParams) (*InitializeResult, error) {
 	if params == nil {
@@ -1182,6 +1196,8 @@ func (ss *ServerSession) setLevel(_ context.Context, params *SetLoggingLevelPara
 // Close performs a graceful shutdown of the connection, preventing new
 // requests from being handled, and waiting for ongoing requests to return.
 // Close then terminates the connection.
+//
+// Close is idempotent and concurrency safe.
 func (ss *ServerSession) Close() error {
 	if ss.keepaliveCancel != nil {
 		// Note: keepaliveCancel access is safe without a mutex because:
@@ -1193,7 +1209,7 @@ func (ss *ServerSession) Close() error {
 	}
 	err := ss.conn.Close()
 
-	if ss.onClose != nil {
+	if ss.onClose != nil && ss.calledOnClose.CompareAndSwap(false, true) {
 		ss.onClose()
 	}
 
