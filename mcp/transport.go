@@ -5,6 +5,7 @@
 package mcp
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -371,32 +372,46 @@ func newIOConn(rwc io.ReadWriteCloser) *ioConn {
 	// but that is unavoidable since AFAIK there is no (easy and portable) way to
 	// guarantee that reads of stdin are unblocked when closed.
 	go func() {
-		dec := json.NewDecoder(rwc)
-		for {
-			var raw json.RawMessage
-			err := dec.Decode(&raw)
-			// If decoding was successful, check for trailing data at the end of the stream.
-			if err == nil {
-				// Read the next byte to check if there is trailing data.
-				var tr [1]byte
-				if n, readErr := dec.Buffered().Read(tr[:]); n > 0 {
-					// If read byte is not a newline, it is an error.
-					if tr[0] != '\n' {
-						err = fmt.Errorf("invalid trailing data at the end of stream")
-					}
-				} else if readErr != nil && readErr != io.EOF {
-					err = readErr
+		scanner := bufio.NewScanner(rwc)
+
+		for scanner.Scan() {
+			line := scanner.Bytes()
+
+			if json.Valid(line) {
+				select {
+				case <-closed:
+					return
+				case incoming <- msgOrErr{msg: json.RawMessage(line)}:
 				}
 			}
-			select {
-			case incoming <- msgOrErr{msg: raw, err: err}:
-			case <-closed:
-				return
-			}
-			if err != nil {
-				return
-			}
 		}
+
+		// dec := json.NewDecoder(rwc)
+		// for {
+		// 	var raw json.RawMessage
+		// 	err := dec.Decode(&raw)
+		// 	// If decoding was successful, check for trailing data at the end of the stream.
+		// 	if err == nil {
+		// 		// Read the next byte to check if there is trailing data.
+		// 		var tr [1]byte
+		// 		if n, readErr := dec.Buffered().Read(tr[:]); n > 0 {
+		// 			// If read byte is not a newline, it is an error.
+		// 			if tr[0] != '\n' {
+		// 				err = fmt.Errorf("invalid trailing data at the end of stream")
+		// 			}
+		// 		} else if readErr != nil && readErr != io.EOF {
+		// 			err = readErr
+		// 		}
+		// 	}
+		// 	select {
+		// 	case incoming <- msgOrErr{msg: raw, err: err}:
+		// 	case <-closed:
+		// 		return
+		// 	}
+		// 	if err != nil {
+		// 		return
+		// 	}
+		// }
 	}()
 	return &ioConn{
 		rwc:      rwc,
